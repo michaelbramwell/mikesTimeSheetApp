@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
@@ -91,73 +92,108 @@ func main() {
 	fmt.Printf(" TIMESHEET: %s to %s\n", startDateStr, endDateStr)
 	fmt.Printf("=========================================\n\n")
 
-	var allActivities []Activity
+	// All fetch functions are independent — run them concurrently.
+	// The Azure block is a single goroutine that authenticates once then fans
+	// out the three Graph API calls (Meetings, Chats, Emails) concurrently.
+	var (
+		mu            sync.Mutex
+		allActivities []Activity
+	)
 
-	// 1. Fetch Git Commits (Doesn't require Azure Auth)
-	allActivities = append(allActivities, fetchGitCommits(startDateStr, endDateStr)...)
+	collect := func(activities []Activity) {
+		mu.Lock()
+		allActivities = append(allActivities, activities...)
+		mu.Unlock()
+	}
 
-	// 2. Fetch Jira Issues
+	var wg sync.WaitGroup
+
+	// Git — local disk, always runs
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		collect(fetchGitCommits(startDateStr, endDateStr))
+	}()
+
+	// Jira
 	if *noJira {
-		fmt.Println("\nSkipping Jira fetch (-noJira flag set).")
+		fmt.Println("Skipping Jira fetch (-noJira flag set).")
 	} else if jiraURL == "" || jiraEmail == "" || jiraToken == "" {
-		fmt.Println("\nJira credentials not set. Please set JIRA_URL, JIRA_EMAIL, and JIRA_TOKEN environment variables.")
-		fmt.Println("Skipping Jira fetch.")
+		fmt.Println("Jira credentials not set. Skipping Jira fetch.")
 	} else {
-		// Convert local day boundaries to UTC for the JQL query.
-		// Jira Cloud does not support timezone offsets in JQL datetime values,
-		// but it does accept UTC datetimes. We expand the window by one day on
-		// each side to avoid any edge cases, then filter results client-side by
-		// the local date on the returned updated timestamp.
 		jiraStart := selectedOpt.Start.UTC().Format("2006-01-02 15:04")
 		jiraEnd := selectedOpt.End.Add(24*time.Hour - time.Minute).UTC().Format("2006-01-02 15:04")
-		allActivities = append(allActivities, fetchJiraIssues(jiraURL, jiraEmail, jiraToken, jiraStart, jiraEnd, selectedOpt.Start, selectedOpt.End)...)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			collect(fetchJiraIssues(jiraURL, jiraEmail, jiraToken, jiraStart, jiraEnd, selectedOpt.Start, selectedOpt.End))
+		}()
 	}
 
-	// 2.5 Fetch GitHub Activity
+	// GitHub
 	if *noGitHub {
-		fmt.Println("\nSkipping GitHub fetch (-noGitHub flag set).")
+		fmt.Println("Skipping GitHub fetch (-noGitHub flag set).")
+	} else if _, errGH := exec.LookPath("gh"); errGH != nil {
+		fmt.Println("GitHub CLI ('gh') not found in PATH. Skipping GitHub fetch.")
 	} else {
-		_, errGH := exec.LookPath("gh")
-		if errGH != nil {
-			fmt.Println("\nGitHub CLI ('gh') not found in PATH. Skipping GitHub fetch.")
-		} else {
-			allActivities = append(allActivities, fetchGitHubActivity(startDateStr, endDateStr)...)
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			collect(fetchGitHubActivity(startDateStr, endDateStr))
+		}()
 	}
 
-	// 3. Authenticate with Azure
+	// Azure: auth once, then fan out Meetings + Chats + Emails concurrently
 	if *noAzure {
-		fmt.Println("\nSkipping Azure Graph API fetch (-noAzure flag set).")
+		fmt.Println("Skipping Azure Graph API fetch (-noAzure flag set).")
 	} else if tenantID == "" || clientID == "" {
-		fmt.Println("\nAzure credentials not set. Please set AZURE_TENANT_ID and AZURE_CLIENT_ID environment variables.")
-		fmt.Println("Skipping Graph API fetch (Meetings & Chats).")
+		fmt.Println("Azure credentials not set. Skipping Graph API fetch (Meetings, Chats & Emails).")
 	} else {
-		fmt.Println("\nAuthenticating with Azure via browser...")
-		cred, err := azidentity.NewInteractiveBrowserCredential(&azidentity.InteractiveBrowserCredentialOptions{
-			TenantID: tenantID,
-			ClientID: clientID,
-		})
-		if err != nil {
-			log.Printf("Authentication failed: %v\n", err)
-		} else {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fmt.Println("Authenticating with Azure via browser...")
+			cred, err := azidentity.NewInteractiveBrowserCredential(&azidentity.InteractiveBrowserCredentialOptions{
+				TenantID: tenantID,
+				ClientID: clientID,
+			})
+			if err != nil {
+				log.Printf("Authentication failed: %v\n", err)
+				return
+			}
 			scopes := []string{"Calendars.Read", "Chat.Read", "Mail.Read"}
 			client, err := msgraphsdk.NewGraphServiceClientWithCredentials(cred, scopes)
 			if err != nil {
 				log.Printf("Failed to create Graph client: %v\n", err)
-			} else {
-				ctx := context.Background()
-
-				// 3. Fetch Meetings
-				allActivities = append(allActivities, fetchMeetings(ctx, client, startDateTime, endDateTime)...)
-
-				// 4. Fetch Chats
-				allActivities = append(allActivities, fetchChats(ctx, client, startDateTime, endDateTime)...)
-
-				// 5. Fetch Sent Emails
-				allActivities = append(allActivities, fetchSentEmails(ctx, client, selectedOpt.Start, selectedOpt.End)...)
+				return
 			}
-		}
+			ctx := context.Background()
+
+			var graphWg sync.WaitGroup
+
+			graphWg.Add(1)
+			go func() {
+				defer graphWg.Done()
+				collect(fetchMeetings(ctx, client, startDateTime, endDateTime))
+			}()
+
+			graphWg.Add(1)
+			go func() {
+				defer graphWg.Done()
+				collect(fetchChats(ctx, client, startDateTime, endDateTime))
+			}()
+
+			graphWg.Add(1)
+			go func() {
+				defer graphWg.Done()
+				collect(fetchSentEmails(ctx, client, selectedOpt.Start, selectedOpt.End))
+			}()
+
+			graphWg.Wait()
+		}()
 	}
+
+	wg.Wait()
 
 	// 5. Post to Projectworks
 	cfg := PWConfig{
@@ -489,6 +525,97 @@ func fetchChats(ctx context.Context, client *msgraphsdk.GraphServiceClient, star
 	} else {
 		fmt.Printf("  - Found %d chat activity/activities in this period.\n", matched)
 	}
+	return activities
+}
+
+// formatEmailDescription builds the Activity description for a sent email.
+func formatEmailDescription(to, subject string) string {
+	if subject == "" {
+		subject = "(no subject)"
+	}
+	if to == "" {
+		to = "unknown"
+	}
+	return fmt.Sprintf("Email to %s: %s", to, subject)
+}
+
+func fetchSentEmails(ctx context.Context, client *msgraphsdk.GraphServiceClient, start, end time.Time) []Activity {
+	var activities []Activity
+	fmt.Println("\nSENT EMAILS:")
+
+	// Build OData filter: sentDateTime within the local day boundaries (expressed as UTC)
+	// We use the same UTC-midnight approach as the rest of the Azure fetches.
+	startFilter := start.Format("2006-01-02") + "T00:00:00Z"
+	endFilter := end.Format("2006-01-02") + "T23:59:59Z"
+	filter := fmt.Sprintf("sentDateTime ge %s and sentDateTime le %s", startFilter, endFilter)
+
+	top := int32(100)
+	orderby := []string{"sentDateTime asc"}
+	selectFields := []string{"subject", "sentDateTime", "toRecipients"}
+
+	mailCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	msgs, err := client.Me().MailFolders().ByMailFolderId("SentItems").Messages().Get(mailCtx, &graphusers.ItemMailFoldersItemMessagesRequestBuilderGetRequestConfiguration{
+		QueryParameters: &graphusers.ItemMailFoldersItemMessagesRequestBuilderGetQueryParameters{
+			Filter:  &filter,
+			Top:     &top,
+			Orderby: orderby,
+			Select:  selectFields,
+		},
+	})
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			fmt.Println("  - Fetching sent emails timed out.")
+			return activities
+		}
+		printError(err)
+		return activities
+	}
+
+	if msgs == nil || len(msgs.GetValue()) == 0 {
+		fmt.Println("  - No sent emails found in this period.")
+		return activities
+	}
+
+	for _, msg := range msgs.GetValue() {
+		subject := "(no subject)"
+		if msg.GetSubject() != nil && *msg.GetSubject() != "" {
+			subject = *msg.GetSubject()
+		}
+
+		sentAt := time.Time{}
+		if msg.GetSentDateTime() != nil {
+			sentAt = *msg.GetSentDateTime()
+		}
+		dateStr := sentAt.Format("2006-01-02")
+		timeStr := sentAt.Format("15:04")
+
+		// Build recipient list
+		var recipients []string
+		for _, r := range msg.GetToRecipients() {
+			if r.GetEmailAddress() != nil && r.GetEmailAddress().GetName() != nil {
+				recipients = append(recipients, *r.GetEmailAddress().GetName())
+			}
+		}
+		toStr := strings.Join(recipients, ", ")
+		if toStr == "" {
+			toStr = "unknown"
+		}
+
+		desc := formatEmailDescription(toStr, subject)
+		fmt.Printf("  - [%s %s] %s\n", dateStr, timeStr, desc)
+
+		activities = append(activities, Activity{
+			Date:        dateStr,
+			Time:        timeStr,
+			Source:      "Email",
+			Description: desc,
+		})
+	}
+
+	fmt.Printf("  - Found %d sent email(s) in this period.\n", len(activities))
+	fmt.Printf("-----------------------------------------\n")
 	return activities
 }
 

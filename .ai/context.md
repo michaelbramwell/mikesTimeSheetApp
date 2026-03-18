@@ -5,7 +5,7 @@
 Personal timesheet automation tool for Mike Bramwell (Diversus/Capricorn). It:
 
 1. Asks interactively which time period to process (Today, Yesterday, individual weekdays, This Week, Last Week, Two Weeks Ago)
-2. Collects work activity from 5 sources across that period
+2. Collects work activity from 6 sources across that period
 3. Posts aggregated activities to Projectworks as timesheet entries — one per day, always 480 minutes (8h), with a rich comment
 
 ## Project Structure
@@ -29,7 +29,7 @@ Patch files (`*.patch`) and `*.orig` / `*.new` snapshots are historical developm
 type Activity struct {
     Date        string  // "YYYY-MM-DD"
     Time        string  // "HH:MM" or "HH:MM-HH:MM"
-    Source      string  // "Git" | "Jira" | "GitHub" | "Meeting" | "Chat"
+    Source      string  // "Git" | "Jira" | "GitHub" | "Meeting" | "Chat" | "Email"
     Description string
 }
 ```
@@ -43,6 +43,7 @@ type Activity struct {
 | GitHub PRs | `fetchGitHubActivity(...)` | `gh search prs` subprocess — raised + reviewed PRs |
 | Meetings | `fetchMeetings(ctx, client, start, end)` | Microsoft Graph `CalendarView` — skips cancelled and "lunch" events |
 | Teams chats | `fetchChats(ctx, client, start, end)` | Microsoft Graph — top 50 chats, top 50 messages per chat, deduped to one Activity per chat per day |
+| Sent emails | `fetchSentEmails(ctx, client, start, end)` | Microsoft Graph — `SentItems` mail folder, filtered by date, up to 100 emails; one Activity per email ("Email to Name: Subject") |
 
 ## Projectworks Integration
 
@@ -70,7 +71,7 @@ type Activity struct {
 
 | Flag | Effect |
 |------|--------|
-| `-noAzure` | Skip Meetings + Chats (no browser OAuth popup) |
+| `-noAzure` | Skip Meetings + Chats + Sent Emails (no browser OAuth popup) |
 | `-noGitHub` | Skip GitHub PR search |
 | `-noJira` | Skip Jira issue search |
 | `-dry-run` | Print what would be posted; don't actually send to Projectworks |
@@ -99,4 +100,4 @@ Busy weeks with >50 updated issues will silently drop results.
 
 ## Azure / Microsoft Graph Auth
 
-Uses `azidentity.NewInteractiveBrowserCredential` — opens a browser tab for OAuth on first run. Scopes: `Calendars.Read`, `Chat.Read`. Controlled by `AZURE_TENANT_ID` + `AZURE_CLIENT_ID`.
+Uses `azidentity.NewInteractiveBrowserCredential` — opens a browser tab for OAuth on first run. Scopes: `Calendars.Read`, `Chat.Read`, `Mail.Read`. Controlled by `AZURE_TENANT_ID` + `AZURE_CLIENT_ID`.
