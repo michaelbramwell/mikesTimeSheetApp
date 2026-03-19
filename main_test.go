@@ -523,7 +523,11 @@ func TestParseDateToWeekStart(t *testing.T) {
 		{"2026-02-24", "2026-02-23"}, // Tuesday -> Monday
 	}
 	for _, tc := range tests {
-		got := parseDateToWeekStart(tc.input)
+		got, err := parseDateToWeekStart(tc.input)
+		if err != nil {
+			t.Errorf("parseDateToWeekStart(%q) returned unexpected error: %v", tc.input, err)
+			continue
+		}
 		if got != tc.want {
 			t.Errorf("parseDateToWeekStart(%q) = %q, want %q", tc.input, got, tc.want)
 		}

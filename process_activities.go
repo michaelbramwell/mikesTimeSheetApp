@@ -6,7 +6,10 @@ import (
 	"strings"
 )
 
-const maxCommentLen = 1000
+const (
+	maxCommentLen  = 1000
+	workdayMinutes = 480
+)
 
 // commentLine holds a fully-rendered line plus the mutable description portion.
 // Only the description is shortened during smart truncation; the prefix (ticket/source),
@@ -143,7 +146,7 @@ func buildDayComment(activities []Activity) string {
 	return result
 }
 
-func processAndPostActivities(activities []Activity, cfg PWConfig, dryRun bool) {
+func processAndPostActivities(activities []Activity, cfg pwConfig, dryRun bool) {
 	fmt.Println("\n=========================================")
 	fmt.Println(" PROJECTWORKS SYNC")
 	fmt.Println("=========================================")
@@ -173,7 +176,7 @@ func processAndPostActivities(activities []Activity, cfg PWConfig, dryRun bool) 
 		return
 	}
 
-	token, existingEntries, err := FetchPWContext(cfg, dates[0])
+	token, existingEntries, err := fetchPWContext(cfg, dates[0])
 	if err != nil {
 		fmt.Printf("Error fetching PW context: %v\n", err)
 		return
@@ -196,12 +199,12 @@ func processAndPostActivities(activities []Activity, cfg PWConfig, dryRun bool) 
 		if dryRun {
 			fmt.Printf("\n[DRY RUN] Would post to Projectworks for %s:\n", date)
 			fmt.Printf("  TaskID: %d\n", cfg.TaskID)
-			fmt.Printf("  Hours: 8 (480 mins)\n")
+			fmt.Printf("  Hours: 8 (%d mins)\n", workdayMinutes)
 			fmt.Printf("  UserTaskHourID: %v\n", idPtr)
 			fmt.Printf("  Comment:\n%s\n", fullComment)
 		} else {
 			fmt.Printf("\nPosting timesheet for %s (8 hours)...\n", date)
-			err := PostPWTimeEntry(cfg, token, date, 480, fullComment, idPtr)
+			err := postPWTimeEntry(cfg, token, date, workdayMinutes, fullComment, idPtr)
 			if err != nil {
 				fmt.Printf("  Error posting: %v\n", err)
 			} else {
@@ -211,7 +214,9 @@ func processAndPostActivities(activities []Activity, cfg PWConfig, dryRun bool) 
 	}
 
 	if !dryRun {
-		weekStart := parseDateToWeekStart(dates[0])
-		fmt.Printf("\nView timesheet: %s/Timesheet/Timesheet?userID=%s&window=week%%3B%s\n", cfg.BaseURL, cfg.UserID, weekStart)
+		weekStart, err := parseDateToWeekStart(dates[0])
+		if err == nil {
+			fmt.Printf("\nView timesheet: %s/Timesheet/Timesheet?userID=%s&window=week%%3B%s\n", cfg.BaseURL, cfg.UserID, weekStart)
+		}
 	}
 }

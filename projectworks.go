@@ -4,35 +4,46 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"regexp"
 	"strings"
 	"time"
 )
 
-type PWConfig struct {
+const pwActionSave = 2
+
+type pwConfig struct {
 	BaseURL string
 	Cookie  string
 	UserID  string
 	TaskID  int
 }
 
-func parseDateToWeekStart(dateStr string) string {
-	t, _ := time.Parse("2006-01-02", dateStr)
+func parseDateToWeekStart(dateStr string) (string, error) {
+	t, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		return "", fmt.Errorf("parseDateToWeekStart: invalid date %q: %w", dateStr, err)
+	}
 	offset := int(time.Monday - t.Weekday())
 	if offset > 0 {
 		offset = -6
 	}
 	startOfWeek := t.AddDate(0, 0, offset)
-	return startOfWeek.Format("2006-01-02")
+	return startOfWeek.Format("2006-01-02"), nil
 }
 
-func FetchPWContext(cfg PWConfig, dateStr string) (string, map[string]int, error) {
-	weekStart := parseDateToWeekStart(dateStr)
+func fetchPWContext(cfg pwConfig, dateStr string) (string, map[string]int, error) {
+	weekStart, err := parseDateToWeekStart(dateStr)
+	if err != nil {
+		return "", nil, err
+	}
 	url := fmt.Sprintf("%s/Timesheet/Timesheet?userID=%s&window=week%%3B%s", cfg.BaseURL, cfg.UserID, weekStart)
 
-	req, _ := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", nil, fmt.Errorf("building PW GET request: %w", err)
+	}
 	req.Header.Set("Cookie", cfg.Cookie)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
 	req.Header.Set("Accept", "text/html, */*; q=0.01")
@@ -56,7 +67,7 @@ func FetchPWContext(cfg PWConfig, dateStr string) (string, map[string]int, error
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", nil, fmt.Errorf("error reading PW context body: %v", err)
 	}
@@ -104,13 +115,13 @@ func FetchPWContext(cfg PWConfig, dateStr string) (string, map[string]int, error
 	return token, existingEntries, nil
 }
 
-func PostPWTimeEntry(cfg PWConfig, token string, dateStr string, minutes int, comment string, existingID *int) error {
+func postPWTimeEntry(cfg pwConfig, token string, dateStr string, minutes int, comment string, existingID *int) error {
 	url := cfg.BaseURL + "/Timesheet/SaveChanges"
 
 	payload := map[string]interface{}{
 		"taskID":               cfg.TaskID,
 		"userID":               cfg.UserID,
-		"action":               2, // Save changes
+		"action":               pwActionSave,
 		"userTaskHourID":       existingID,
 		"editDate":             dateStr,
 		"originalMinutes":      0,
@@ -125,9 +136,15 @@ func PostPWTimeEntry(cfg PWConfig, token string, dateStr string, minutes int, co
 		payload["originalComment"] = ""      // Or whatever was there
 	}
 
-	jsonPayload, _ := json.Marshal(payload)
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshalling PW payload: %w", err)
+	}
 
-	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonPayload))
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return fmt.Errorf("building PW POST request: %w", err)
+	}
 	req.Header.Set("Cookie", cfg.Cookie)
 	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
 	req.Header.Set("RequestVerificationToken", token)
