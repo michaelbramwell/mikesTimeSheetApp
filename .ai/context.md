@@ -2,7 +2,7 @@
 
 ## What This App Does
 
-Personal timesheet automation tool for Mike Bramwell (Diversus/Capricorn). It:
+Personal timesheet automation tool. It:
 
 1. Asks interactively which time period to process (Today, Yesterday, individual weekdays, This Week, Last Week, Two Weeks Ago)
 2. Collects work activity from 6 sources across that period
@@ -38,8 +38,8 @@ type Activity struct {
 
 | Source | Function | How |
 |--------|----------|-----|
-| Git commits | `fetchGitCommits(since, until)` | Walks `~/dev/diversus/` (4 levels deep), runs `git log --author="Mike Bramwell"` per repo |
-| Jira issues | `fetchJiraIssues(...)` | JQL via Basic Auth against `https://capsoc.atlassian.net` — finds issues updated in range where user is assignee/creator/watcher/reporter |
+| Git commits | `fetchGitCommits(since, until, author, searchDir)` | Walks `GIT_SEARCH_DIR` (4 levels deep), runs `git log --author=GIT_AUTHOR` per repo |
+| Jira issues | `fetchJiraIssues(...)` | JQL via Basic Auth against your `JIRA_URL` — finds issues updated in range where user is assignee/creator/watcher/reporter |
 | GitHub PRs | `fetchGitHubActivity(...)` | `gh search prs` subprocess — raised + reviewed PRs |
 | Meetings | `fetchMeetings(ctx, client, start, end)` | Microsoft Graph `CalendarView` — skips cancelled and "lunch" events |
 | Teams chats | `fetchChats(ctx, client, start, end)` | Microsoft Graph — top 50 chats, top 50 messages per chat, deduped to one Activity per chat per day |
@@ -49,10 +49,10 @@ type Activity struct {
 
 - **Auth:** Session cookie (`PW_COOKIE` env var) scraped from browser — must be refreshed manually when it expires
 - **CSRF:** `FetchPWContext()` scrapes `__RequestVerificationToken` from the timesheet HTML page
-- **Existing entries:** Scrapes `<tr data-taskID="53209">` + `data-cellDetails` JSON to detect existing entries (update vs. create)
-- **POST:** `/Timesheet/SaveChanges` with `taskID=53209`, `userID`, `minutes=480`, `comment`
+- **Existing entries:** Scrapes `<tr data-taskID=PW_TASK_ID>` + `data-cellDetails` JSON to detect existing entries (update vs. create)
+- **POST:** `/Timesheet/SaveChanges` with `taskID=PW_TASK_ID`, `userID`, `minutes=480`, `comment`
 - **Comment format:** `- [Source] Description` lines, truncated to 1000 chars; Jira tickets use `[TICKET-KEY]` instead of `[Jira]`
-- **URL:** `https://diversus.projectworksapp.com`
+- **URL:** `PW_BASE_URL` (e.g. `https://yourorg.projectworksapp.com`)
 
 ## Environment Variables (set in `run.sh`)
 
@@ -60,12 +60,15 @@ type Activity struct {
 |-----|---------|
 | `AZURE_TENANT_ID` | Microsoft Entra tenant ID |
 | `AZURE_CLIENT_ID` | Azure App Registration client ID |
-| `JIRA_URL` | `https://capsoc.atlassian.net` |
-| `JIRA_EMAIL` | `mike.bramwell@capricorn.coop` |
+| `JIRA_URL` | Your Jira instance URL (e.g. `https://yourorg.atlassian.net`) |
+| `JIRA_EMAIL` | Your Atlassian account email |
 | `JIRA_TOKEN` | Jira API token |
+| `GIT_AUTHOR` | Your git author name (must match git commit author exactly) |
+| `GIT_SEARCH_DIR` | Root directory to search for git repos (e.g. `~/dev/myorg`) |
+| `PW_BASE_URL` | Projectworks base URL (e.g. `https://yourorg.projectworksapp.com`) |
 | `PW_COOKIE` | Projectworks session cookie (expires, needs manual refresh) |
-| `PW_USER_ID` | `"82"` |
-| `PW_TASK_ID` | `"53209"` |
+| `PW_USER_ID` | Your Projectworks user ID |
+| `PW_TASK_ID` | Your Projectworks task ID |
 
 ## CLI Flags
 

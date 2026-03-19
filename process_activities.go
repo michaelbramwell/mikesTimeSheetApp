@@ -6,25 +6,139 @@ import (
 	"strings"
 )
 
+const maxCommentLen = 1000
+
+// commentLine holds a fully-rendered line plus the mutable description portion.
+// Only the description is shortened during smart truncation; the prefix (ticket/source),
+// timestamps, and time codes are always preserved.
+type commentLine struct {
+	prefix   string // e.g. "[Git]" or "[DTP-1164]"
+	desc     string // free-text that may be shortened
+	timecode string // e.g. "(1h15m)" or "" — always kept
+	isTotal  bool   // section-total lines are never shortened
+}
+
+// render returns the line as it will appear in the comment.
+func (c commentLine) render() string {
+	if c.isTotal {
+		return c.prefix // total lines are already fully formed
+	}
+	line := fmt.Sprintf("- %s %s", c.prefix, c.desc)
+	if c.timecode != "" {
+		line += " " + c.timecode
+	}
+	return line
+}
+
 // buildDayComment constructs the Projectworks comment string for a single day's activities.
+// Activities are grouped by source. Each item shows its duration if known, and a
+// section-total line is appended after each source group.
+// If the result exceeds maxCommentLen, descriptions are shortened (keeping prefixes,
+// timestamps, ticket keys, and time codes) until it fits.
 func buildDayComment(activities []Activity) string {
-	var comments []string
+	if len(activities) == 0 {
+		return ""
+	}
+
+	// Preserve source order of first appearance.
+	var sourceOrder []string
+	bySource := make(map[string][]Activity)
 	for _, a := range activities {
-		prefix := fmt.Sprintf("[%s]", a.Source)
-		if a.Source == "Jira" && !strings.HasPrefix(a.Description, "[") {
-			parts := strings.SplitN(a.Description, "|", 2)
-			if len(parts) == 2 {
-				ticket := strings.TrimSpace(parts[0])
-				title := strings.TrimSpace(parts[1])
-				prefix = fmt.Sprintf("[%s]", ticket)
-				a.Description = title
+		if _, exists := bySource[a.Source]; !exists {
+			sourceOrder = append(sourceOrder, a.Source)
+		}
+		bySource[a.Source] = append(bySource[a.Source], a)
+	}
+
+	var cls []commentLine
+	for _, src := range sourceOrder {
+		group := bySource[src]
+		sourceTotal := 0
+		for _, a := range group {
+			prefix := fmt.Sprintf("[%s]", a.Source)
+			desc := strings.TrimSpace(a.Description)
+
+			if a.Source == "Jira" && !strings.HasPrefix(desc, "[") {
+				parts := strings.SplitN(desc, "|", 2)
+				if len(parts) == 2 {
+					ticket := strings.TrimSpace(parts[0])
+					prefix = fmt.Sprintf("[%s]", ticket)
+					desc = strings.TrimSpace(parts[1])
+				}
+			}
+
+			timecode := ""
+			if a.Minutes > 0 {
+				timecode = fmt.Sprintf("(%s)", formatMins(a.Minutes))
+			}
+			cls = append(cls, commentLine{prefix: prefix, desc: desc, timecode: timecode})
+			sourceTotal += a.Minutes
+		}
+		if sourceTotal > 0 {
+			cls = append(cls, commentLine{
+				prefix:  fmt.Sprintf("- [%s total] ~%s", src, formatMins(sourceTotal)),
+				isTotal: true,
+			})
+		}
+	}
+
+	// Fast path: fits within limit.
+	joined := func() string {
+		parts := make([]string, len(cls))
+		for i, c := range cls {
+			parts[i] = c.render()
+		}
+		return strings.Join(parts, "\n")
+	}
+	result := joined()
+	if len(result) <= maxCommentLen {
+		return result
+	}
+
+	// Smart truncation: shorten descriptions proportionally until we fit.
+	// Total lines and timecodes are never touched.
+	// Count how many chars the non-truncatable parts occupy.
+	overhead := 0
+	descCount := 0
+	for _, c := range cls {
+		if c.isTotal {
+			overhead += len(c.render()) + 1 // +1 for newline
+			continue
+		}
+		// "- [prefix] " + " (timecode)" + newline
+		overhead += len(fmt.Sprintf("- %s  %s", c.prefix, c.timecode)) + 1
+		descCount++
+	}
+
+	if descCount == 0 {
+		// Nothing to shorten; hard-truncate as last resort.
+		return result[:maxCommentLen-3] + "..."
+	}
+
+	// Budget split evenly across all description slots.
+	descBudget := (maxCommentLen - overhead) / descCount
+	if descBudget < 0 {
+		descBudget = 0
+	}
+
+	for i := range cls {
+		if cls[i].isTotal {
+			continue
+		}
+		d := cls[i].desc
+		if len(d) > descBudget {
+			if descBudget > 1 {
+				cls[i].desc = d[:descBudget-1] + "~"
+			} else {
+				cls[i].desc = "~"
 			}
 		}
-		comments = append(comments, fmt.Sprintf("- %s %s", prefix, strings.TrimSpace(a.Description)))
 	}
-	result := strings.Join(comments, "\n")
-	if len(result) > 1000 {
-		result = result[:997] + "..."
+
+	result = joined()
+	// Final hard cap in case rounding left us slightly over.
+	if len(result) > maxCommentLen {
+		result = result[:maxCommentLen-3] + "..."
 	}
 	return result
 }
@@ -98,6 +212,6 @@ func processAndPostActivities(activities []Activity, cfg PWConfig, dryRun bool) 
 
 	if !dryRun {
 		weekStart := parseDateToWeekStart(dates[0])
-		fmt.Printf("\nView timesheet: https://diversus.projectworksapp.com/Timesheet/Timesheet?userID=%s&window=week%%3B%s\n", cfg.UserID, weekStart)
+		fmt.Printf("\nView timesheet: %s/Timesheet/Timesheet?userID=%s&window=week%%3B%s\n", cfg.BaseURL, cfg.UserID, weekStart)
 	}
 }

@@ -11,18 +11,90 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/andygrunwald/go-jira"
+	"github.com/joho/godotenv"
 	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
 	"github.com/microsoftgraph/msgraph-sdk-go/models/odataerrors"
 	graphusers "github.com/microsoftgraph/msgraph-sdk-go/users"
 )
 
+// ticketRe matches Jira-style ticket keys like CDS-123 or PROJ-42.
+var ticketRe = regexp.MustCompile(`\b([A-Z]+-\d+)\b`)
+
+// commitEntry holds a parsed git commit for time estimation purposes.
+type commitEntry struct {
+	ts     time.Time
+	date   string
+	ticket string // first ticket key found in message, "" if none
+}
+
+// extractTicketKey returns the first Jira-style ticket key found in msg, or "".
+func extractTicketKey(msg string) string {
+	m := ticketRe.FindStringSubmatch(msg)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// calcGitSessionMins estimates minutes spent given a sorted slice of commit
+// timestamps. Rules:
+//   - The first commit of each session gets 15 min of padding (pre-commit work).
+//   - Consecutive commits ≤ sessionGap apart are in the same session; the gap
+//     between them is counted as work time.
+//   - A gap > sessionGap starts a new session (another 15 min padding).
+func calcGitSessionMins(timestamps []time.Time) int {
+	if len(timestamps) == 0 {
+		return 0
+	}
+	sort.Slice(timestamps, func(i, j int) bool {
+		return timestamps[i].Before(timestamps[j])
+	})
+	const sessionGap = 2 * time.Hour
+	const padding = 15 // mins per session start
+	total := padding   // first commit always gets padding
+	for i := 1; i < len(timestamps); i++ {
+		gap := timestamps[i].Sub(timestamps[i-1])
+		if gap <= sessionGap {
+			total += int(gap.Minutes())
+		} else {
+			total += padding // new session
+		}
+	}
+	// Round up to nearest 15-minute increment (Projectworks requirement).
+	if r := total % 15; r != 0 {
+		total += 15 - r
+	}
+	return total
+}
+
+// formatMins renders a minute count as e.g. "15m", "1h", "1h30m".
+func formatMins(mins int) string {
+	h := mins / 60
+	m := mins % 60
+	switch {
+	case h > 0 && m > 0:
+		return fmt.Sprintf("%dh%dm", h, m)
+	case h > 0:
+		return fmt.Sprintf("%dh", h)
+	default:
+		return fmt.Sprintf("%dm", m)
+	}
+}
+
 func main() {
+	// Load .env file if present (existing env vars take precedence).
+	// Errors are silently ignored so the app works fine when env vars are
+	// injected directly (e.g. in CI or when the file doesn't exist yet).
+	_ = godotenv.Load()
+
 	noAzure := flag.Bool("noazure", false, "Disable Azure (Meetings/Chats) fetch")
 	noGitHub := flag.Bool("nogithub", false, "Disable GitHub fetch")
 	noJira := flag.Bool("nojira", false, "Disable Jira fetch")
@@ -37,6 +109,30 @@ func main() {
 	jiraURL := os.Getenv("JIRA_URL")
 	jiraEmail := os.Getenv("JIRA_EMAIL")
 	jiraToken := os.Getenv("JIRA_TOKEN")
+
+	// Git configuration from Environment Variables
+	gitAuthor := os.Getenv("GIT_AUTHOR")
+	if gitAuthor == "" {
+		log.Fatal("GIT_AUTHOR env var is required (e.g. 'Jane Smith')")
+	}
+	gitSearchDir := os.Getenv("GIT_SEARCH_DIR")
+	if gitSearchDir == "" {
+		log.Fatal("GIT_SEARCH_DIR env var is required (e.g. '~/dev/myorg')")
+	}
+
+	// Projectworks configuration from Environment Variables
+	pwBaseURL := os.Getenv("PW_BASE_URL")
+	if pwBaseURL == "" {
+		log.Fatal("PW_BASE_URL env var is required (e.g. 'https://myorg.projectworksapp.com')")
+	}
+	pwTaskIDStr := os.Getenv("PW_TASK_ID")
+	if pwTaskIDStr == "" {
+		log.Fatal("PW_TASK_ID env var is required")
+	}
+	var pwTaskID int
+	if _, err := fmt.Sscanf(pwTaskIDStr, "%d", &pwTaskID); err != nil {
+		log.Fatalf("PW_TASK_ID must be a number, got %q", pwTaskIDStr)
+	}
 
 	// Determine Date Range Interactively
 	now := time.Now()
@@ -112,7 +208,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		collect(fetchGitCommits(startDateStr, endDateStr))
+		collect(fetchGitCommits(startDateStr, endDateStr, gitAuthor, gitSearchDir))
 	}()
 
 	// Jira
@@ -197,23 +293,37 @@ func main() {
 
 	// 5. Post to Projectworks
 	cfg := PWConfig{
-		Cookie: os.Getenv("PW_COOKIE"),
-		UserID: os.Getenv("PW_USER_ID"),
-		TaskID: 53209,
+		BaseURL: pwBaseURL,
+		Cookie:  os.Getenv("PW_COOKIE"),
+		UserID:  os.Getenv("PW_USER_ID"),
+		TaskID:  pwTaskID,
 	}
 	processAndPostActivities(allActivities, cfg, *dryRun)
 }
 
-func fetchGitCommits(since, until string) []Activity {
+func fetchGitCommits(since, until, author, searchDir string) []Activity {
 	var activities []Activity
 	fmt.Println("GIT COMMITS:")
+
+	// git --until is exclusive (treats the value as midnight of that day), so
+	// advance the end date by one day to include all commits on the `until` date.
+	untilTime, err := time.ParseInLocation("2006-01-02", until, time.Local)
+	if err == nil {
+		until = untilTime.AddDate(0, 0, 1).Format("2006-01-02")
+	}
+
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Printf("Error getting home dir: %v\n", err)
 		return activities
 	}
 
-	searchDir := filepath.Join(homeDir, "dev", "diversus")
+	// Expand leading ~ in searchDir
+	if len(searchDir) >= 2 && searchDir[:2] == "~/" {
+		searchDir = filepath.Join(homeDir, searchDir[2:])
+	} else if searchDir == "~" {
+		searchDir = homeDir
+	}
 
 	// Find all .git directories up to 3 levels deep
 	var gitDirs []string
@@ -234,11 +344,14 @@ func fetchGitCommits(since, until string) []Activity {
 		return nil
 	})
 
+	// allEntries collects every commit across all repos for time estimation.
+	var allEntries []commitEntry
+
 	totalCommits := 0
 	for _, repoDir := range gitDirs {
-		cmd := exec.Command("git", "-C", repoDir, "log", "--author=Mike Bramwell",
-			fmt.Sprintf("--since=%s", since),
-			fmt.Sprintf("--until=%s", until),
+		cmd := exec.Command("git", "-C", repoDir, "log", "--author="+author,
+			fmt.Sprintf("--since=%s 00:00", since),
+			fmt.Sprintf("--until=%s 00:00", until),
 			"--format=%ad | %s", "--date=format:%Y-%m-%d %H:%M", "--all")
 
 		var out bytes.Buffer
@@ -260,16 +373,23 @@ func fetchGitCommits(since, until string) []Activity {
 				date := ""
 				timeStr := ""
 				desc := line
+				var ts time.Time
 				if len(parts) == 2 {
 					// parts[0] is "YYYY-MM-DD HH:MM"
 					datetime := parts[0]
 					if len(datetime) >= 16 {
 						date = datetime[:10]
 						timeStr = datetime[11:16]
+						ts, _ = time.ParseInLocation("2006-01-02 15:04", datetime[:16], time.Local)
 					} else {
 						date = datetime
 					}
 					desc = fmt.Sprintf("[%s] %s %s", projectName, timeStr, parts[1])
+					allEntries = append(allEntries, commitEntry{
+						ts:     ts,
+						date:   date,
+						ticket: extractTicketKey(parts[1]),
+					})
 				} else {
 					desc = fmt.Sprintf("[%s] %s", projectName, line)
 				}
@@ -288,7 +408,65 @@ func fetchGitCommits(since, until string) []Activity {
 	if totalCommits == 0 {
 		fmt.Println("  No commits found in this period.")
 	} else {
-		fmt.Printf("\nTotal Commits: %d\n", totalCommits)
+		// --- Real time estimation from commit timestamps ---
+
+		// Group all commit timestamps by date.
+		byDate := make(map[string][]time.Time)
+		for _, e := range allEntries {
+			if !e.ts.IsZero() {
+				byDate[e.date] = append(byDate[e.date], e.ts)
+			}
+		}
+
+		// Sort dates for consistent output.
+		var dates []string
+		for d := range byDate {
+			dates = append(dates, d)
+		}
+		sort.Strings(dates)
+
+		// dayMins maps date -> estimated minutes for that day.
+		dayMins := make(map[string]int)
+		grandTotalMins := 0
+		fmt.Printf("\nTotal Commits: %d\nEstimated Git Time:\n", totalCommits)
+		for _, d := range dates {
+			mins := calcGitSessionMins(byDate[d])
+			dayMins[d] = mins
+			grandTotalMins += mins
+			fmt.Printf("  %s: ~%s (%d commit(s))\n", d, formatMins(mins), len(byDate[d]))
+
+			// Per-ticket breakdown for this day.
+			ticketTs := make(map[string][]time.Time)
+			for _, e := range allEntries {
+				if e.date == d && e.ticket != "" && !e.ts.IsZero() {
+					ticketTs[e.ticket] = append(ticketTs[e.ticket], e.ts)
+				}
+			}
+			if len(ticketTs) > 0 {
+				var tickets []string
+				for k := range ticketTs {
+					tickets = append(tickets, k)
+				}
+				sort.Strings(tickets)
+				for _, tk := range tickets {
+					tsMins := calcGitSessionMins(ticketTs[tk])
+					fmt.Printf("    [%s]: ~%s (%d commit(s))\n", tk, formatMins(tsMins), len(ticketTs[tk]))
+				}
+			}
+		}
+		fmt.Printf("  Grand Total Git Time: ~%s\n", formatMins(grandTotalMins))
+
+		// Stamp the day total on the first git Activity for each date;
+		// subsequent commits on the same day get Minutes=0 so buildDayComment
+		// sums correctly (the total is already represented once).
+		firstSeen := make(map[string]bool)
+		for i := range activities {
+			d := activities[i].Date
+			if !firstSeen[d] {
+				firstSeen[d] = true
+				activities[i].Minutes = dayMins[d]
+			}
+		}
 	}
 	fmt.Printf("-----------------------------------------\n")
 	return activities
@@ -368,6 +546,7 @@ func fetchMeetings(ctx context.Context, client *msgraphsdk.GraphServiceClient, s
 					Time:        timeRange,
 					Source:      "Meeting",
 					Description: fmt.Sprintf("%s %s (%s)", timeRange, subject, durationStr),
+					Minutes:     int(duration.Minutes()),
 				})
 			}
 		}
@@ -515,6 +694,7 @@ func fetchChats(ctx context.Context, client *msgraphsdk.GraphServiceClient, star
 				Time:        timeStr,
 				Source:      "Chat",
 				Description: fmt.Sprintf("%s %s", timeStr, topic),
+				Minutes:     15,
 			})
 			matched++
 		}
@@ -523,7 +703,9 @@ func fetchChats(ctx context.Context, client *msgraphsdk.GraphServiceClient, star
 	if matched == 0 {
 		fmt.Println("  - No chats found in this period.")
 	} else {
-		fmt.Printf("  - Found %d chat activity/activities in this period.\n", matched)
+		const minsPerChat = 15
+		totalEstMins := matched * minsPerChat
+		fmt.Printf("  - Found %d chat activity/activities in this period (~%d mins each, ~%d mins total).\n", matched, minsPerChat, totalEstMins)
 	}
 	return activities
 }
@@ -611,10 +793,11 @@ func fetchSentEmails(ctx context.Context, client *msgraphsdk.GraphServiceClient,
 			Time:        timeStr,
 			Source:      "Email",
 			Description: desc,
+			Minutes:     15,
 		})
 	}
 
-	fmt.Printf("  - Found %d sent email(s) in this period.\n", len(activities))
+	fmt.Printf("  - Found %d sent email(s) in this period (~15 mins each, ~%d mins total).\n", len(activities), len(activities)*15)
 	fmt.Printf("-----------------------------------------\n")
 	return activities
 }
@@ -724,8 +907,14 @@ func fetchJiraIssues(jiraURL, email, token, startDateStr, endDateStr string, loc
 				Time:        t.Format("15:04"),
 				Source:      "Jira",
 				Description: fmt.Sprintf("%s | %s (Status: %s)", issue.Key, issue.Fields.Summary, statusName),
+				Minutes:     30,
 			})
 		}
+	}
+	if len(activities) > 0 {
+		const minsPerIssue = 30
+		totalEstMins := len(activities) * minsPerIssue
+		fmt.Printf("  Total Jira Items: %d (~%d mins each, ~%d mins total)\n", len(activities), minsPerIssue, totalEstMins)
 	}
 	fmt.Printf("-----------------------------------------\n")
 	return activities
@@ -756,6 +945,9 @@ func fetchGitHubActivity(startDateStr, endDateStr string) []Activity {
 	var activities []Activity
 	fmt.Println("\nGITHUB ACTIVITY:")
 
+	raisedCount := 0
+	reviewedCount := 0
+
 	// Fetch PRs created by the user
 	authorCmd := exec.Command("gh", "search", "prs", "--author=@me", fmt.Sprintf("--created=%s..%s", startDateStr, endDateStr), "--json", "repository,number,title,url,createdAt")
 	var authorOut bytes.Buffer
@@ -778,8 +970,10 @@ func fetchGitHubActivity(startDateStr, endDateStr string) []Activity {
 					Time:        t.Format("15:04"),
 					Source:      "GitHub",
 					Description: fmt.Sprintf("Raised PR #%d: %s", issue.Number, issue.Title),
+					Minutes:     60,
 				})
 			}
+			raisedCount = len(authored)
 		} else {
 			fmt.Println("  No PRs raised.")
 		}
@@ -807,13 +1001,22 @@ func fetchGitHubActivity(startDateStr, endDateStr string) []Activity {
 					Time:        t.Format("15:04"),
 					Source:      "GitHub",
 					Description: fmt.Sprintf("Reviewed PR #%d: %s", issue.Number, issue.Title),
+					Minutes:     30,
 				})
 			}
+			reviewedCount = len(commented)
 		} else {
 			fmt.Println("  \n  No PRs commented on/reviewed.")
 		}
 	}
 
+	const minsPerRaisedPR = 60
+	const minsPerReviewedPR = 30
+	totalEstMins := raisedCount*minsPerRaisedPR + reviewedCount*minsPerReviewedPR
+	if raisedCount > 0 || reviewedCount > 0 {
+		fmt.Printf("  Estimated: %d raised (~%d mins each) + %d reviewed (~%d mins each) = ~%d mins total\n",
+			raisedCount, minsPerRaisedPR, reviewedCount, minsPerReviewedPR, totalEstMins)
+	}
 	fmt.Printf("-----------------------------------------\n")
 	return activities
 }

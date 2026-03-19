@@ -12,9 +12,10 @@ import (
 )
 
 type PWConfig struct {
-	Cookie string
-	UserID string
-	TaskID int
+	BaseURL string
+	Cookie  string
+	UserID  string
+	TaskID  int
 }
 
 func parseDateToWeekStart(dateStr string) string {
@@ -29,7 +30,7 @@ func parseDateToWeekStart(dateStr string) string {
 
 func FetchPWContext(cfg PWConfig, dateStr string) (string, map[string]int, error) {
 	weekStart := parseDateToWeekStart(dateStr)
-	url := fmt.Sprintf("https://diversus.projectworksapp.com/Timesheet/Timesheet?userID=%s&window=week%%3B%s", cfg.UserID, weekStart)
+	url := fmt.Sprintf("%s/Timesheet/Timesheet?userID=%s&window=week%%3B%s", cfg.BaseURL, cfg.UserID, weekStart)
 
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("Cookie", cfg.Cookie)
@@ -74,8 +75,7 @@ func FetchPWContext(cfg PWConfig, dateStr string) (string, map[string]int, error
 	token := tokenMatch[1]
 
 	// 2. Find existing entries for the target task.
-	// We look for tr with data-taskID="53209"
-	// Then look at its child td elements for data-cellDetails which has date and userTaskHoursID
+	// We look for tr with data-taskID matching cfg.TaskID
 	taskRegexStr := fmt.Sprintf(`data-taskID="%d".*?</tr>`, cfg.TaskID)
 	taskRegex := regexp.MustCompile("(?s)" + taskRegexStr)
 	taskMatch := taskRegex.FindString(html)
@@ -105,7 +105,7 @@ func FetchPWContext(cfg PWConfig, dateStr string) (string, map[string]int, error
 }
 
 func PostPWTimeEntry(cfg PWConfig, token string, dateStr string, minutes int, comment string, existingID *int) error {
-	url := "https://diversus.projectworksapp.com/Timesheet/SaveChanges"
+	url := cfg.BaseURL + "/Timesheet/SaveChanges"
 
 	payload := map[string]interface{}{
 		"taskID":               cfg.TaskID,
