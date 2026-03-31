@@ -146,7 +146,7 @@ func buildDayComment(activities []Activity) string {
 	return result
 }
 
-func processAndPostActivities(activities []Activity, cfg pwConfig, dryRun bool) {
+func processAndPostActivities(activities []Activity, cfg pwConfig, dryRun bool, startDate, endDate string) {
 	fmt.Println("\n=========================================")
 	fmt.Println(" PROJECTWORKS SYNC")
 	fmt.Println("=========================================")
@@ -164,10 +164,12 @@ func processAndPostActivities(activities []Activity, cfg pwConfig, dryRun bool) 
 		}
 	}
 
-	// Sort dates
+	// Sort dates, filtering to only those within the selected range
 	var dates []string
 	for d := range byDate {
-		dates = append(dates, d)
+		if d >= startDate && d <= endDate {
+			dates = append(dates, d)
+		}
 	}
 	sort.Strings(dates)
 

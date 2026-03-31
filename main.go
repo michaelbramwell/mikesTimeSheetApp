@@ -225,5 +225,5 @@ func main() {
 		UserID:  os.Getenv("PW_USER_ID"),
 		TaskID:  pwTaskID,
 	}
-	processAndPostActivities(allActivities, cfg, *dryRun)
+	processAndPostActivities(allActivities, cfg, *dryRun, startDateStr, endDateStr)
 }
