@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,6 +46,12 @@ func main() {
 	gitSearchDir := os.Getenv("GIT_SEARCH_DIR")
 	if gitSearchDir == "" {
 		log.Fatal("GIT_SEARCH_DIR env var is required (e.g. '~/dev/myorg')")
+	}
+	gitSearchDepth := 5
+	if depthStr := os.Getenv("GIT_SEARCH_DEPTH"); depthStr != "" {
+		if d, err := strconv.Atoi(depthStr); err == nil && d > 0 {
+			gitSearchDepth = d
+		}
 	}
 
 	// Projectworks configuration from Environment Variables
@@ -135,7 +142,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		collect(fetchGitCommits(startDateStr, endDateStr, gitAuthor, gitSearchDir))
+		collect(fetchGitCommits(startDateStr, endDateStr, gitAuthor, gitSearchDir, gitSearchDepth))
 	}()
 
 	// Jira
@@ -217,6 +224,23 @@ func main() {
 	}
 
 	wg.Wait()
+
+	// --- AI Summary ---
+	fmt.Printf("\n=========================================\n")
+	fmt.Printf(" AI SUMMARY\n")
+	fmt.Printf("=========================================\n")
+	summary := generateAISummary(allActivities)
+	fmt.Println(summary)
+
+	// --- Confirm before posting ---
+	fmt.Printf("\n=========================================\n")
+	fmt.Print("Post to Projectworks? [y/N]: ")
+	var confirm string
+	fmt.Scanln(&confirm)
+	if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
+		fmt.Println("Aborted. Nothing posted to Projectworks.")
+		return
+	}
 
 	// Post to Projectworks
 	cfg := pwConfig{

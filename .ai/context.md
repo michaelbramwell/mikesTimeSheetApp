@@ -15,6 +15,11 @@ main.go                  # Entry point + all data-fetching functions
 models.go                # Activity struct (shared data type)
 process_activities.go    # Activity processing + Projectworks posting
 projectworks.go          # Projectworks HTTP client (scrape CSRF + POST)
+summarise.go             # AI summary via `opencode run` + confirm prompt
+fetch_git.go             # Git authored commits + GitReview (teammate commits)
+fetch_github.go          # GitHub PR raised + reviewed
+fetch_azure.go           # Meetings, Chats, Sent Emails via Microsoft Graph
+fetch_jira.go            # Jira issues via JQL
 main_test.go             # Unit tests
 go.mod / go.sum          # Go 1.24 module
 run.sh                   # GITIGNORED — contains all secrets/env vars
@@ -29,8 +34,9 @@ Patch files (`*.patch`) and `*.orig` / `*.new` snapshots are historical developm
 type Activity struct {
     Date        string  // "YYYY-MM-DD"
     Time        string  // "HH:MM" or "HH:MM-HH:MM"
-    Source      string  // "Git" | "Jira" | "GitHub" | "Meeting" | "Chat" | "Email"
+    Source      string  // "Git" | "GitReview" | "Jira" | "GitHub" | "Meeting" | "Chat" | "Email"
     Description string
+    Minutes     int     // estimated or actual duration; 0 = unknown
 }
 ```
 
@@ -38,7 +44,8 @@ type Activity struct {
 
 | Source | Function | How |
 |--------|----------|-----|
-| Git commits | `fetchGitCommits(since, until, author, searchDir)` | Walks `GIT_SEARCH_DIR` (4 levels deep), runs `git log --author=GIT_AUTHOR` per repo |
+| Git commits | `fetchGitCommits(since, until, author, searchDir, searchDepth)` | Walks `GIT_SEARCH_DIR` up to `GIT_SEARCH_DEPTH` levels (default 5), runs `git log --author=GIT_AUTHOR` per repo |
+| Git reviews | `fetchGitReviews(since, until, author, gitDirs)` | Second pass over same repos: commits by authors other than `GIT_AUTHOR` — teammate work likely reviewed/merged |
 | Jira issues | `fetchJiraIssues(...)` | JQL via Basic Auth against your `JIRA_URL` — finds issues updated in range where user is assignee/creator/watcher/reporter |
 | GitHub PRs | `fetchGitHubActivity(...)` | `gh search prs` subprocess — raised + reviewed PRs |
 | Meetings | `fetchMeetings(ctx, client, start, end)` | Microsoft Graph `CalendarView` — skips cancelled and "lunch" events |
@@ -64,7 +71,8 @@ type Activity struct {
 | `JIRA_EMAIL` | Your Atlassian account email |
 | `JIRA_TOKEN` | Jira API token |
 | `GIT_AUTHOR` | Your git author name (must match git commit author exactly) |
-| `GIT_SEARCH_DIR` | Root directory to search for git repos (e.g. `~/dev/myorg`) |
+| `GIT_SEARCH_DIR` | Root directory to search for git repos (e.g. `~/dev/diversus`) |
+| `GIT_SEARCH_DEPTH` | How many directory levels deep to search (default: 5) |
 | `PW_BASE_URL` | Projectworks base URL (e.g. `https://yourorg.projectworksapp.com`) |
 | `PW_COOKIE` | Projectworks session cookie (expires, needs manual refresh) |
 | `PW_USER_ID` | Your Projectworks user ID |
