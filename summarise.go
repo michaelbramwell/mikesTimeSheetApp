@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"time"
 )
 
 // generateAISummary formats all activities into a structured prompt and sends
@@ -76,7 +77,7 @@ func buildSummaryPrompt(activities []Activity) string {
 		}
 	}
 
-	sort.Strings(dates)
+	sort.Sort(sort.Reverse(sort.StringSlice(dates)))
 
 	var sb strings.Builder
 	sb.WriteString(`You are a timesheet assistant. Given the following work activities grouped by date, produce a concise natural-language daily summary for each day.
@@ -94,7 +95,9 @@ Keep each day's summary to 3-5 sentences. Use plain text, no markdown headers.
 
 	for _, date := range dates {
 		d := byDate[date]
-		sb.WriteString(fmt.Sprintf("\nDate: %s\n", date))
+		t, _ := time.Parse("2006-01-02", date)
+		dayOfWeek := t.Weekday().String()
+		sb.WriteString(fmt.Sprintf("\nDate: %s (%s)\n", date, dayOfWeek))
 
 		if len(d.authored) > 0 {
 			sb.WriteString("  Authored:\n")
